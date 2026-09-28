@@ -15,7 +15,26 @@ import std.array : join;
 import std.conv : to;
 import std.exception : enforce;
 import std.json : JSONType, JSONValue;
-import std.string : strip;
+import std.string : replace, strip;
+
+struct CheckMetadata
+{
+    string declaration;
+    string property;
+    string kind;
+    string policy;
+    string cExpression;
+    string dType;
+    string unsupportedValue;
+    string unsupportedReason;
+}
+
+struct PendingCheck
+{
+    CheckMetadata check;
+    string status;
+    string reason;
+}
 
 /*
  * Passive C/D measurements share indexes and labels. An empty expected value
@@ -32,6 +51,10 @@ struct Probe
     string[] labels;
     string[] expectedValues;
     string[] callLabels;
+
+    CheckMetadata[] checks;
+    CheckMetadata[] callChecks;
+    PendingCheck[] pendingChecks;
 }
 
 void objectKeys(JSONValue value, string[] allowed, string context)
@@ -99,51 +122,600 @@ private string rowPrefix(size_t index)
 }
 
 private void measurement(ref Probe probe, string label, string cExpression,
-        string dExpression, string expected = "")
+        string dExpression, string expected = "", CheckMetadata check = CheckMetadata.init)
 {
     auto prefix = rowPrefix(probe.labels.length);
 
     probe.labels ~= label;
     probe.expectedValues ~= expected;
+    probe.checks ~= check;
 
     probe.cSource ~= "    printf(\"" ~ prefix ~ "%zu\\n\", (size_t)(" ~ cExpression ~ "));\n";
     probe.dSource ~= "    writeln(\"" ~ prefix ~ "\", " ~ dExpression ~ ");\n";
 }
 
+void validateManifest(JSONValue manifest)
+{
+    objectKeys(manifest, [
+        "headers", "imports", "cFlags", "dFlags", "types", "constants",
+        "functions", "cSource", "dSource", "calls"
+    ], "manifest");
+
+    strings(manifest, "headers", true);
+    strings(manifest, "imports", true);
+    strings(manifest, "cFlags");
+    strings(manifest, "dFlags");
+
+    foreach (entry; arrayValue(manifest, "types"))
+    {
+        objectKeys(entry, ["c", "d", "fields", "opaque"], "type");
+        requiredText(entry, "c", "type");
+        requiredText(entry, "d", "type");
+
+        if (auto opaque = "opaque" in entry.object)
+        {
+            enforce(opaque.type == JSONType.true_
+                    || opaque.type == JSONType.false_, "type.opaque must be a boolean");
+            enforce(opaque.type != JSONType.true_ || !("fields" in entry.object),
+                    "opaque types cannot select fields");
+        }
+
+        if (auto fields = "fields" in entry.object)
+        {
+            enforce(fields.type == JSONType.array || (fields.type == JSONType.string
+                    && fields.str == "*"), "type.fields must be an array or '*'");
+
+            if (fields.type == JSONType.array)
+            {
+                foreach (field; fields.array)
+                {
+                    if (field.type == JSONType.string)
+                    {
+                        text(field, "field");
+                    }
+                    else
+                    {
+                        objectKeys(field, ["c", "d"], "field");
+                        requiredText(field, "c", "field");
+                        requiredText(field, "d", "field");
+                    }
+                }
+            }
+        }
+    }
+
+    foreach (entry; arrayValue(manifest, "functions"))
+    {
+        objectKeys(entry, ["c", "d", "returns", "parameters", "variadic"], "function");
+        requiredText(entry, "c", "function");
+        requiredText(entry, "d", "function");
+
+        bool hasReturn = ("returns" in entry.object) !is null;
+        bool hasParameters = ("parameters" in entry.object) !is null;
+
+        enforce(hasReturn == hasParameters,
+                "function requires both 'returns' and 'parameters', or neither for inference");
+
+        if (hasReturn)
+        {
+            objectKeys(entry["returns"], ["c", "d"], "function.returns");
+            requiredText(entry["returns"], "c", "function.returns");
+            requiredText(entry["returns"], "d", "function.returns");
+
+            foreach (parameter; arrayValue(entry, "parameters", true))
+            {
+                objectKeys(parameter, ["c", "d"], "function parameter");
+                requiredText(parameter, "c", "function parameter");
+                requiredText(parameter, "d", "function parameter");
+            }
+        }
+
+        if (auto flag = "variadic" in entry.object)
+        {
+            enforce(hasReturn, "function.variadic requires an explicit signature");
+            enforce(flag.type == JSONType.true_ || flag.type == JSONType.false_,
+                    "function.variadic must be a boolean");
+        }
+    }
+
+    foreach (key; ["constants", "calls"])
+    {
+        foreach (entry; arrayValue(manifest, key))
+        {
+            auto cKey = key == "calls" ? "name" : "c";
+
+            objectKeys(entry, [cKey, "d"], key);
+            requiredText(entry, cKey, key);
+            requiredText(entry, "d", key);
+        }
+    }
+
+    foreach (key; ["cSource", "dSource"])
+    {
+        if (auto source = key in manifest.object)
+        {
+            text(*source, key, false);
+        }
+    }
+}
+
+private struct Candidate
+{
+    string type;
+    string condition;
+    string[] arityVariants;
+}
+
+private struct Alternatives
+{
+    Candidate[] values;
+    string reason;
+}
+
 /*
- * Let the compilers classify scalar types instead of maintaining C spelling
- * rules here. Category zero is opaque: it does not establish equivalence of
- * pointees, array elements, aggregate members, or nested callback signatures.
+ * C11 cannot decompose arbitrary function pointer types. Build only complete,
+ * bounded candidates, then let _Generic check each native C declaration.
+ * D's target model prunes impossible integer spellings; independent C layout
+ * predicates still guard every surviving choice. No candidate is a cast.
+ * Each arity variant adds int at one callable node. C acceptance of both the
+ * original and altered signatures demonstrates an incomplete prototype.
  */
-private void semantics(ref Probe probe, string label, string cExpression, string dType)
+private struct RepresentationMatcher
 {
-    measurement(probe, label ~ " scalar kind",
-            "_Generic((" ~ cExpression ~ ")," ~ " _Bool: 1, char: (CHAR_MIN < 0 ? 2 : 3),"
-            ~ " signed char: 2, unsigned char: 3," ~ " short: 2, unsigned short: 3,"
-            ~ " int: 2, unsigned int: 3," ~ " long: 2, unsigned long: 3,"
-            ~ " long long: 2, unsigned long long: 3," ~ " float: 4, double: 4, long double: 4, default: 0)",
-            "dabiprobeScalarKind!(" ~ dType ~ ")");
+    JSONValue reflection;
+    JSONValue[] types;
+    string declarations;
+    size_t nextType;
+
+    private string define(string pattern)
+    {
+        auto name = "dabiprobe_rep_" ~ to!string(nextType++);
+
+        declarations ~= "    typedef " ~ pattern.replace("@", name) ~ ";\n";
+
+        return name;
+    }
+
+    private string layout(JSONValue node, string cType)
+    {
+        return "sizeof(" ~ cType ~ ") == " ~ to!string(
+                node["size"].integer) ~ " && _Alignof(" ~ cType ~ ") == " ~ to!string(
+                node["align"].integer);
+    }
+
+    private bool isOpaque(JSONValue node)
+    {
+        auto mapping = node["mapping"].integer;
+
+        if (mapping < 0)
+        {
+            return false;
+        }
+
+        auto flag = "opaque" in types[cast(size_t) mapping].object;
+
+        return flag !is null && flag.type == JSONType.true_;
+    }
+
+    Alternatives explicitCandidates(string returnType, string[] parameterTypes,
+            bool variadic, JSONValue contract)
+    {
+        string signature(string resultType, string[] parameters)
+        {
+            auto arguments = parameters.length ? parameters.join(", ") : "void";
+
+            if (variadic)
+            {
+                arguments ~= ", ...";
+            }
+
+            return define(resultType ~ " (*@)(" ~ arguments ~ ")");
+        }
+
+        Alternatives result;
+        auto normal = signature(returnType, parameterTypes);
+        auto extra = signature(returnType, parameterTypes ~ ["int"]);
+
+        result.values ~= Candidate(normal, "1", [extra]);
+
+        if (contract.type != JSONType.object)
+        {
+            return result;
+        }
+
+        auto nodes = [contract["returns"]] ~ contract["parameters"].array;
+        size_t projectionCount = 2;
+
+        foreach (index, node; nodes)
+        {
+            auto choices = candidates(node);
+
+            if (choices.reason.length)
+            {
+                return choices;
+            }
+
+            foreach (choice; choices.values)
+            {
+                if (choice.arityVariants.length == 0)
+                {
+                    continue;
+                }
+
+                projectionCount += 1 + choice.arityVariants.length;
+
+                if (projectionCount > 256)
+                {
+                    return Alternatives(null,
+                            "signature exceeds the limit of 256 complete C type candidates including prototype checks");
+                }
+
+                auto projectedParameters = parameterTypes.dup;
+                auto projectedReturn = returnType;
+
+                if (index == 0)
+                {
+                    projectedReturn = choice.type;
+                }
+                else
+                {
+                    projectedParameters[index - 1] = choice.type;
+                }
+
+                auto projected = signature(projectedReturn, projectedParameters);
+                string[] variants;
+
+                foreach (variantType; choice.arityVariants)
+                {
+                    if (index == 0)
+                    {
+                        projectedReturn = variantType;
+                    }
+                    else
+                    {
+                        projectedParameters[index - 1] = variantType;
+                    }
+
+                    variants ~= signature(projectedReturn, projectedParameters);
+                }
+
+                result.values ~= Candidate(projected, "1", variants);
+            }
+        }
+
+        return result;
+    }
+
+    Alternatives candidates(JSONValue node, bool pointee = false)
+    {
+        if (node.type != JSONType.object)
+        {
+            return Alternatives(null, "compiler reflection is required for representation checks");
+        }
+
+        if (auto reason = "reason" in node.object)
+        {
+            return Alternatives(null, reason.str);
+        }
+
+        auto kind = node["kind"].str;
+        auto qualifier = node["qualifier"].str.length ? " const" : "";
+        Alternatives result;
+
+        if (kind == "void")
+        {
+            result.values ~= Candidate("void" ~ qualifier, "1");
+        }
+        else if (kind == "signed" || kind == "unsigned")
+        {
+            foreach (integer; reflection["integers"].array)
+            {
+                if (integer["size"] != node["size"] || integer["align"] != node["align"])
+                {
+                    continue;
+                }
+
+                auto spelling = integer["c"].str;
+
+                if (kind == "unsigned")
+                {
+                    spelling = spelling == "signed char" ? "unsigned char" : "unsigned " ~ spelling;
+                }
+
+                result.values ~= Candidate(spelling ~ qualifier, layout(node, spelling));
+            }
+        }
+        else if (kind == "bool" || kind == "char" || kind == "float")
+        {
+            auto spelling = kind == "bool" ? "_Bool" : kind == "char" ? "char" : node["format"].str;
+            auto condition = layout(node, spelling);
+
+            if (kind == "float")
+            {
+                auto prefix = spelling == "float" ? "FLT" : spelling == "double" ? "DBL" : "LDBL";
+
+                condition ~= " && " ~ prefix ~ "_MANT_DIG == " ~ to!string(
+                        node["digits"].integer) ~ " && " ~ prefix ~ "_MAX_EXP == " ~ to!string(
+                        node["maxExponent"].integer);
+            }
+
+            result.values ~= Candidate(spelling ~ qualifier, condition);
+        }
+        else if (kind == "aggregate")
+        {
+            auto mapping = node["mapping"].integer;
+
+            if (mapping < 0)
+            {
+                return Alternatives(null,
+                        "aggregate requires a selected C/D type mapping: " ~ node["name"].str);
+            }
+
+            auto spelling = requiredText(types[cast(size_t) mapping], "c", "type");
+
+            if (isOpaque(node))
+            {
+                if (!pointee)
+                {
+                    return Alternatives(null,
+                            "opaque aggregate mappings support pointer contracts only, not by-value use: "
+                            ~ node["name"].str);
+                }
+
+                return Alternatives([Candidate(spelling ~ qualifier, "1")]);
+            }
+
+            if (node["complete"].type != JSONType.true_)
+            {
+                return Alternatives(null,
+                        "incomplete aggregate requires an explicit opaque:true type mapping: "
+                        ~ node["name"].str);
+            }
+
+            result.values ~= Candidate(spelling ~ qualifier, layout(node, spelling));
+        }
+        else if (kind == "pointer" || kind == "array")
+        {
+            if (kind == "array" && node["length"].integer == 0)
+            {
+                return Alternatives(null, "zero-length arrays are not standard C types");
+            }
+
+            auto child = candidates(node["element"], kind == "pointer");
+
+            if (child.reason.length)
+            {
+                return child;
+            }
+
+            foreach (candidate; child.values)
+            {
+                auto declarator = kind == "pointer" ? " *" ~ qualifier ~ " @" : qualifier ~ " @[" ~ to!string(
+                        node["length"].integer) ~ "]";
+                auto name = define(candidate.type ~ declarator);
+                string[] variants;
+
+                foreach (variantType; candidate.arityVariants)
+                {
+                    variants ~= define(variantType ~ declarator);
+                }
+
+                result.values ~= Candidate(name,
+                        "(" ~ candidate.condition ~ ") && " ~ layout(node, name), variants);
+            }
+        }
+        else if (kind == "function")
+        {
+            auto returns = candidates(node["returns"]);
+
+            if (returns.reason.length)
+            {
+                return returns;
+            }
+
+            Candidate[] combinations = [Candidate("", "1")];
+
+            foreach (parameter; node["parameters"].array)
+            {
+                auto choices = candidates(parameter);
+
+                if (choices.reason.length)
+                {
+                    return choices;
+                }
+
+                if (combinations.length * choices.values.length * returns.values.length > 256)
+                {
+                    return Alternatives(null,
+                            "signature exceeds the limit of 256 complete C type candidates");
+                }
+
+                Candidate[] next;
+                size_t projectionCount;
+
+                foreach (combination; combinations)
+                {
+                    foreach (choice; choices.values)
+                    {
+                        projectionCount += 1 + combination.arityVariants.length
+                            + choice.arityVariants.length;
+
+                        if (projectionCount * returns.values.length > 256)
+                        {
+                            return Alternatives(null, "signature exceeds the limit of 256 complete C type candidates including prototype checks");
+                        }
+
+                        auto separator = combination.type.length ? ", " : "";
+                        string[] variants;
+
+                        foreach (variantType; combination.arityVariants)
+                        {
+                            variants ~= variantType ~ separator ~ choice.type;
+                        }
+
+                        foreach (variantType; choice.arityVariants)
+                        {
+                            variants ~= combination.type ~ separator ~ variantType;
+                        }
+
+                        next ~= Candidate(combination.type ~ separator ~ choice.type,
+                                "(" ~ combination.condition ~ ") && (" ~ choice.condition ~ ")",
+                                variants);
+                    }
+                }
+
+                combinations = next;
+            }
+
+            size_t projectionCount;
+
+            foreach (returnsCandidate; returns.values)
+            {
+                foreach (combination; combinations)
+                {
+                    projectionCount += 2 + returnsCandidate.arityVariants.length
+                        + combination.arityVariants.length;
+
+                    if (projectionCount > 256)
+                    {
+                        return Alternatives(null,
+                                "signature exceeds the limit of 256 complete C type candidates including prototype checks");
+                    }
+
+                    auto parameters = combination.type.length ? combination.type : "void";
+                    auto declarator = " (*" ~ qualifier ~ " @)(";
+                    auto name = define(returnsCandidate.type ~ declarator ~ parameters ~ ")");
+                    auto linkage = node["linkage"].str == "C" ? "1" : "0";
+                    auto extraParameters = combination.type.length
+                        ? combination.type ~ ", int" : "int";
+                    string[] variants = [
+                        define(returnsCandidate.type ~ declarator ~ extraParameters ~ ")")
+                    ];
+
+                    foreach (variantType; returnsCandidate.arityVariants)
+                    {
+                        variants ~= define(variantType ~ declarator ~ parameters ~ ")");
+                    }
+
+                    foreach (variantType; combination.arityVariants)
+                    {
+                        variants ~= define(returnsCandidate.type ~ declarator ~ variantType ~ ")");
+                    }
+
+                    result.values ~= Candidate(name,
+                            "(" ~ returnsCandidate.condition ~ ") && (" ~ combination.condition ~ ") && " ~ layout(node,
+                                name) ~ " && " ~ linkage, variants);
+                }
+            }
+        }
+
+        if (result.values.length == 0)
+        {
+            result.reason = "no supported C representation candidates for " ~ node["name"].str;
+        }
+
+        return result;
+    }
 }
 
-private void typeMeasurements(ref Probe probe, string label, string cType, string dType)
+private string compatibilityExpression(string cAddress, Candidate[] candidates,
+        bool functionDeclaration, ref CheckMetadata check)
 {
-    measurement(probe, label ~ " sizeof", "sizeof(" ~ cType ~ ")", "(" ~ dType ~ ").sizeof");
-    measurement(probe, label ~ " alignof", "_Alignof(" ~ cType ~ ")", "(" ~ dType ~ ").alignof");
+    string[] expressions;
+    string[] incompletePrototypes;
 
-    semantics(probe, label, "(" ~ cType ~ "){0}", dType);
+    foreach (candidate; candidates)
+    {
+        auto suffix = functionDeclaration ? "" : " *";
+        auto compatible = "(_Generic((" ~ cAddress ~ "), " ~ candidate.type
+            ~ suffix ~ ": 1, default: 0) && (" ~ candidate.condition ~ "))";
+
+        expressions ~= compatible;
+
+        foreach (variantType; candidate.arityVariants)
+        {
+            incompletePrototypes ~= "(" ~ compatible ~ " && _Generic(("
+                ~ cAddress ~ "), " ~ variantType ~ suffix ~ ": 1, default: 0))";
+        }
+    }
+
+    auto expression = expressions.join(" || ");
+
+    if (incompletePrototypes.length)
+    {
+        check.unsupportedValue = "2";
+        check.unsupportedReason = "C callable type accepts incompatible parameter counts; "
+            ~ "a complete prototype is required, including nested callbacks";
+        expression = "(" ~ incompletePrototypes.join(" || ") ~ ") ? 2 : (" ~ expression ~ ")";
+    }
+
+    return expression;
 }
 
-Probe generate(JSONValue manifest)
+private void representation(ref Probe probe, ref RepresentationMatcher matcher,
+        string label, string cAddress, JSONValue node, bool functionDeclaration = false)
+{
+    auto check = CheckMetadata(label, functionDeclaration ? "declaration" : "representation",
+            functionDeclaration ? "declaration" : "representation",
+            "C11 compatible types; D-target integer alternatives guarded by C layout; "
+            ~ "named aggregates use selected mappings; const/immutable map to C const; "
+            ~ "D char maps to C char, not encoding, signedness or ownership guarantees");
+
+    check.cExpression = cAddress;
+    check.dType = node.type == JSONType.object ? node["name"].str : "";
+
+    auto choices = matcher.candidates(node);
+
+    if (choices.reason.length)
+    {
+        matcher.declarations = "";
+        probe.pendingChecks ~= PendingCheck(check, "unsupported", choices.reason);
+        return;
+    }
+
+    probe.cSource ~= matcher.declarations;
+    matcher.declarations = "";
+
+    auto expression = compatibilityExpression(cAddress, choices.values,
+            functionDeclaration, check);
+
+    measurement(probe, label ~ " " ~ check.property, expression, "1", "1", check);
+}
+
+private void typeMeasurements(ref Probe probe, ref RepresentationMatcher matcher, string label, string cType,
+        string dType, JSONValue descriptor = JSONValue.init, bool selectedAggregate = false)
+{
+    if (descriptor.type == JSONType.object && descriptor["kind"].str == "aggregate")
+    {
+        if (descriptor["complete"].type != JSONType.true_ || matcher.isOpaque(descriptor))
+        {
+            representation(probe, matcher, label, "&((" ~ cType ~ "){0})", descriptor);
+            return;
+        }
+    }
+
+    measurement(probe, label ~ " sizeof", "sizeof(" ~ cType ~ ")", "(" ~ dType ~ ").sizeof",
+            "", CheckMetadata(label, "sizeof", "layout", "compiler layout"));
+    measurement(probe, label ~ " alignof", "_Alignof(" ~ cType ~ ")", "(" ~ dType ~ ").alignof",
+            "", CheckMetadata(label, "alignof", "layout", "compiler layout"));
+
+    if (selectedAggregate && descriptor.type == JSONType.object
+            && descriptor["kind"].str == "aggregate")
+    {
+        return;
+    }
+
+    representation(probe, matcher, label, "&((" ~ cType ~ "){0})", descriptor);
+}
+
+Probe generate(JSONValue manifest, JSONValue reflection = JSONValue.init)
 {
     /*
      * Validate the manifest's shape, not a home-grown subset of C or D syntax.
      * Expressions and source fragments remain trusted compiler input; unknown
      * keys are errors so a misspelled check cannot disappear silently.
      */
-    objectKeys(manifest, [
-        "headers", "imports", "cFlags", "dFlags", "types", "constants",
-        "functions", "cSource", "dSource", "calls"
-    ], "manifest");
+    validateManifest(manifest);
 
     auto headers = strings(manifest, "headers", true);
     auto imports = strings(manifest, "imports", true);
@@ -156,36 +728,16 @@ Probe generate(JSONValue manifest)
             "manifest must select at least one type, constant, function or call");
 
     Probe probe;
+    auto matcher = RepresentationMatcher(reflection, types);
+    bool reflected = reflection.type == JSONType.object;
 
-    probe.cSource = "#include <stdio.h>\n" ~ "#include <stddef.h>\n"
-        ~ "#include <stdint.h>\n" ~ "#include <inttypes.h>\n" ~ "#include <limits.h>\n";
+    probe.cSource = "#include <stdio.h>\n" ~ "#include <stddef.h>\n" ~ "#include <stdint.h>\n"
+        ~ "#include <inttypes.h>\n" ~ "#include <limits.h>\n" ~ "#include <float.h>\n";
 
     probe.dSource = q{
         import std.stdio : writeln;
-        import std.traits : isIntegral, isSomeChar, isUnsigned, isFloatingPoint,
+        import std.traits : isIntegral, isSomeChar,
             OriginalType, Unqual, isStaticArray;
-
-        template dabiprobeScalarKind(T)
-        {
-            alias Base = Unqual!(OriginalType!T);
-
-            static if (is(Base == bool))
-            {
-                enum dabiprobeScalarKind = 1;
-            }
-            else static if (isIntegral!Base || isSomeChar!Base)
-            {
-                enum dabiprobeScalarKind = isUnsigned!Base || isSomeChar!Base ? 3 : 2;
-            }
-            else static if (isFloatingPoint!Base)
-            {
-                enum dabiprobeScalarKind = 4;
-            }
-            else
-            {
-                enum dabiprobeScalarKind = 0;
-            }
-        }
     };
 
     foreach (header; headers)
@@ -220,12 +772,14 @@ Probe generate(JSONValue manifest)
     probe.cSource ~= "int main(void) {\n";
     probe.dSource ~= "void main() {\n";
 
-    measurement(probe, "baseline pointer.sizeof", "sizeof(void*)", "(void*).sizeof");
+    measurement(probe, "baseline pointer.sizeof", "sizeof(void*)", "(void*).sizeof",
+            "", CheckMetadata("target", "pointer.sizeof", "target", "compiler target"));
 
     auto endianPrefix = rowPrefix(probe.labels.length);
 
     probe.labels ~= "baseline endianness";
     probe.expectedValues ~= "";
+    probe.checks ~= CheckMetadata("target", "endianness", "target", "compiler target");
 
     probe.cSource ~= "    uint16_t dabiprobe_endian = 1;\n";
     probe.cSource ~= "    printf(\"" ~ endianPrefix
@@ -233,17 +787,81 @@ Probe generate(JSONValue manifest)
     probe.dSource ~= "    version (LittleEndian) writeln(\"" ~ endianPrefix
         ~ "little\");\n" ~ "    else writeln(\"" ~ endianPrefix ~ "big\");\n";
 
-    foreach (type; types)
+    foreach (typeIndex, type; types)
     {
-        objectKeys(type, ["c", "d", "fields"], "type");
+        objectKeys(type, ["c", "d", "fields", "opaque"], "type");
 
         auto cType = requiredText(type, "c", "type");
         auto dType = requiredText(type, "d", "type");
         auto label = cType ~ " <-> " ~ dType;
 
-        typeMeasurements(probe, label, cType, dType);
+        auto descriptor = reflected ? reflection["types"][typeIndex]["type"] : JSONValue.init;
+        auto allFields = reflected ? reflection["types"][typeIndex]["fields"].array : null;
+        auto opaque = "opaque" in type.object;
 
-        foreach (field; arrayValue(type, "fields"))
+        if (opaque !is null && opaque.type == JSONType.true_)
+        {
+            auto check = CheckMetadata(label, "object layout", "layout",
+                    "explicit opaque handle mapping");
+
+            if (!reflected || descriptor["kind"].str != "aggregate")
+            {
+                probe.pendingChecks ~= PendingCheck(check, "unsupported",
+                        "opaque mapping requires a compiler-reflected D aggregate type");
+            }
+            else
+            {
+                probe.pendingChecks ~= PendingCheck(check, "unchecked", "opaque mapping does not inspect object size, alignment or members; pointer contracts are checked separately");
+            }
+
+            continue;
+        }
+
+        if (reflected && descriptor["kind"].str == "aggregate"
+                && descriptor["complete"].type != JSONType.true_)
+        {
+            probe.pendingChecks ~= PendingCheck(CheckMetadata(label,
+                    "object layout", "layout", "complete aggregate required"),
+                    "unsupported",
+                    "incomplete aggregate requires an explicit opaque:true type mapping");
+            continue;
+        }
+
+        typeMeasurements(probe, matcher, label, cType, dType, descriptor, true);
+
+        JSONValue[] selectedFields;
+
+        if (auto fields = "fields" in type.object)
+        {
+            if (fields.type == JSONType.array)
+            {
+                selectedFields = fields.array;
+            }
+            else if (reflected)
+            {
+                foreach (field; allFields)
+                {
+                    selectedFields ~= field["name"];
+                }
+
+                if (descriptor["kind"].str != "aggregate")
+                {
+                    probe.pendingChecks ~= PendingCheck(CheckMetadata(label,
+                            "fields", "layout", "reflected instance fields"),
+                            "unsupported", "fields:'*' requires a D struct or union");
+                }
+            }
+            else
+            {
+                probe.pendingChecks ~= PendingCheck(CheckMetadata(label,
+                        "fields", "layout", "reflected instance fields"),
+                        "unsupported", "compiler reflection is required for fields:'*'");
+            }
+        }
+
+        string[] selectedNames;
+
+        foreach (field; selectedFields)
         {
             string cField;
             string dField;
@@ -264,11 +882,44 @@ Probe generate(JSONValue manifest)
             auto cExpression = "((" ~ cType ~ "*)0)->" ~ cField;
             auto dExpression = dType ~ "." ~ dField;
 
+            selectedNames ~= dField;
+
             measurement(probe, fieldLabel ~ " offsetof",
-                    "offsetof(" ~ cType ~ ", " ~ cField ~ ")", dExpression ~ ".offsetof");
-            measurement(probe, fieldLabel ~ " sizeof",
-                    "sizeof(" ~ cExpression ~ ")", dExpression ~ ".sizeof");
-            semantics(probe, fieldLabel, cExpression, "typeof(" ~ dExpression ~ ")");
+                    "offsetof(" ~ cType ~ ", " ~ cField ~ ")", dExpression ~ ".offsetof",
+                    "", CheckMetadata(fieldLabel, "offsetof", "layout", "compiler layout"));
+            measurement(probe, fieldLabel ~ " sizeof", "sizeof(" ~ cExpression ~ ")", dExpression ~ ".sizeof", "",
+                    CheckMetadata(fieldLabel, "sizeof", "layout", "compiler layout"));
+
+            JSONValue fieldType;
+
+            foreach (candidate; allFields)
+            {
+                if (candidate["name"].str == dField)
+                {
+                    fieldType = candidate["type"];
+                    break;
+                }
+            }
+
+            representation(probe, matcher, fieldLabel, "&(" ~ cExpression ~ ")", fieldType);
+        }
+
+        if (reflected && descriptor["kind"].str == "aggregate")
+        {
+            foreach (field; allFields)
+            {
+                if (!selectedNames.canFind(field["name"].str))
+                {
+                    probe.pendingChecks ~= PendingCheck(CheckMetadata(label ~ " field " ~ field["name"].str,
+                            "coverage", "representation",
+                            "selected fields only"), "unchecked",
+                            "D instance field was not selected");
+                }
+            }
+
+            probe.pendingChecks ~= PendingCheck(CheckMetadata(label,
+                    "C member completeness", "representation", "D-reflected member selection"),
+                    "unchecked", "C-only members and padding contents are not enumerated");
         }
     }
 
@@ -288,6 +939,8 @@ Probe generate(JSONValue manifest)
 
         probe.labels ~= "constant " ~ cExpression ~ " <-> " ~ dExpression;
         probe.expectedValues ~= "";
+        probe.checks ~= CheckMetadata("constant " ~ cExpression ~ " <-> " ~ dExpression,
+                "value", "value", "integral value through 64 bits");
 
         probe.cSource ~= "    _Static_assert(_Generic(" ~ cExpression
             ~ ", _Bool: 1, char: 1, signed char: 1, unsigned char: 1, short: 1, unsigned short: 1,"
@@ -336,7 +989,20 @@ Probe generate(JSONValue manifest)
         auto dFunction = requiredText(functionEntry, "d", "function");
         auto returnValue = "returns" in functionEntry.object;
 
-        enforce(returnValue !is null, "function: missing 'returns'");
+        if (returnValue is null)
+        {
+            auto descriptor = reflected ? reflection["functions"][index]["type"] : JSONValue.init;
+            auto label = "function " ~ cFunction ~ " <-> " ~ dFunction;
+
+            representation(probe, matcher, label, "&" ~ cFunction, descriptor, true);
+
+            probe.pendingChecks ~= PendingCheck(CheckMetadata(label, "behavior",
+                    "call", "declarations are not executed"),
+                    "unchecked",
+                    "declaration compatibility does not establish behavior, ownership or lifetime");
+            continue;
+        }
+
         objectKeys(*returnValue, ["c", "d"], "function.returns");
 
         auto cReturn = requiredText(*returnValue, "c", "function.returns");
@@ -385,7 +1051,11 @@ Probe generate(JSONValue manifest)
             probe.dSource ~= "    static assert(!isStaticArray!" ~ name
                 ~ ", \"D static array function parameters require an explicit pointer contract\");\n";
 
-            typeMeasurements(probe, label ~ " parameter " ~ to!string(parameterIndex), name, name);
+            auto descriptor = reflected ? reflection["functions"][index]["parameters"][parameterIndex]
+                : JSONValue.init;
+
+            typeMeasurements(probe, matcher,
+                    label ~ " parameter " ~ to!string(parameterIndex), name, name, descriptor);
         }
 
         /* Literal void needs no layout probe and cannot be used with sizeof. */
@@ -394,11 +1064,16 @@ Probe generate(JSONValue manifest)
 
         if (cVoid != dVoid)
         {
-            measurement(probe, label ~ " return void", cVoid ? "1" : "0", dVoid ? "1" : "0");
+            measurement(probe, label ~ " return void", cVoid ? "1" : "0", dVoid ? "1" : "0", "",
+                    CheckMetadata(label, "return void", "declaration", "explicit signature"));
         }
         else if (!cVoid)
         {
-            typeMeasurements(probe, label ~ " return", typeName ~ "_return", typeName ~ "_return");
+            auto descriptor = reflected ? reflection["functions"][index]["returns"] : JSONValue
+                .init;
+
+            typeMeasurements(probe, matcher, label ~ " return",
+                    typeName ~ "_return", typeName ~ "_return", descriptor);
         }
 
         auto cParameters = parameterNames.length == 0 ? "void" : parameterNames.join(", ");
@@ -420,8 +1095,35 @@ Probe generate(JSONValue manifest)
          * Implicit conversion accepts stronger D attributes (nothrow, @nogc)
          * without erasing ABI-relevant linkage, ref parameters, or variadics.
          */
-        measurement(probe, label ~ " declaration", "_Generic((&" ~ cFunction ~ "), " ~ typeName ~ ": 1, default: 0)",
-                "(is(" ~ typeName ~ "_actual : " ~ typeName ~ ") ? 1 : 0)", "1");
+        auto check = CheckMetadata(label, "declaration", "declaration",
+                "explicit C and D signatures must both match; native C prototype completeness is required");
+        auto contract = reflected ? reflection["functions"][index] : JSONValue.init;
+        auto choices = matcher.explicitCandidates(typeName ~ "_return",
+                parameterNames, variadic, contract);
+
+        check.cExpression = "&" ~ cFunction;
+        check.dType = reflected ? contract["type"]["name"].str : "";
+
+        if (choices.reason.length)
+        {
+            matcher.declarations = "";
+            probe.pendingChecks ~= PendingCheck(check, "unsupported", choices.reason);
+        }
+        else
+        {
+            probe.cSource ~= matcher.declarations;
+            matcher.declarations = "";
+
+            auto complete = compatibilityExpression(check.cExpression, choices.values, true, check);
+            auto compatible = "_Generic((&" ~ cFunction ~ "), " ~ typeName ~ ": 1, default: 0)";
+
+            measurement(probe, label ~ " declaration", "(" ~ complete ~ ") == 2 ? 2 : (" ~ compatible ~ ")",
+                    "(is(" ~ typeName ~ "_actual : " ~ typeName ~ ") ? 1 : 0)", "1", check);
+        }
+
+        probe.pendingChecks ~= PendingCheck(CheckMetadata(label, "behavior",
+                "call", "declarations are not executed"), "unchecked",
+                "declaration compatibility does not establish behavior, ownership or lifetime");
     }
 
     /*
@@ -447,6 +1149,8 @@ Probe generate(JSONValue manifest)
         auto prefix = rowPrefix(probe.callLabels.length);
 
         probe.callLabels ~= name;
+        probe.callChecks ~= CheckMetadata(name, "call assertion", "call",
+                "explicit bool expression must be true");
         probe.dCallSource ~= "    writeln(\"" ~ prefix ~ "\", ((" ~ expression ~ ") ? 1 : 0));\n";
     }
 

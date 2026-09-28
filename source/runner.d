@@ -11,10 +11,10 @@
 module runner;
 
 import std.algorithm : canFind;
-import std.conv : to;
+import std.conv : octal, to;
 import std.exception : enforce;
 import std.file : rmdirRecurse, tempDir;
-import std.path : absolutePath, buildPath;
+import std.path : absolutePath, baseName, buildPath, dirName;
 import std.process : Config, execute;
 import std.stdio : stderr;
 
@@ -73,31 +73,75 @@ version (Windows)
 else version (Posix)
 {
     import core.sys.posix.stdlib : mkdtemp;
-    import std.string : fromStringz;
+    import core.sys.posix.sys.stat : mkdir;
+    import std.string : fromStringz, toStringz;
 }
 else
 {
     static assert(false, "dabiprobe requires a Windows or POSIX host");
 }
 
+struct CommandRecord
+{
+    string[] arguments;
+    string directory;
+    string stage;
+    string output;
+    string error;
+    int status;
+    bool started;
+}
+
+alias CommandObserver = void delegate(CommandRecord);
+
 /*
  * Pass literal argv elements: flags and paths are never joined into a shell
  * command. execute merges stdout/stderr; compiler diagnostics are forwarded,
  * while unsolicited probe diagnostics fail the caller's strict row parser.
  */
-string run(string[] arguments, string directory, string stage, bool diagnostics = false)
+string run(string[] arguments, string directory, string stage,
+        bool diagnostics = false, CommandObserver observer = null)
 {
-    auto result = execute(arguments, null, Config.none, size_t.max, directory);
+    CommandRecord record;
 
-    if (diagnostics && result.output.length)
+    record.arguments = arguments.dup;
+    record.directory = directory;
+    record.stage = stage;
+
+    try
     {
-        stderr.write(result.output);
+        auto result = execute(arguments, null, Config.none, size_t.max, directory);
+
+        record.started = true;
+        record.status = result.status;
+        record.output = result.output;
+    }
+    catch (Exception error)
+    {
+        record.error = error.msg;
+
+        if (observer !is null)
+        {
+            observer(record);
+        }
+
+        throw error;
     }
 
-    enforce(result.status == 0, stage ~ " failed (exit " ~ to!string(
-            result.status) ~ ")" ~ (diagnostics ? "" : ":\n" ~ result.output));
+    if (observer !is null)
+    {
+        observer(record);
+    }
 
-    return result.output;
+    if (diagnostics && record.output.length)
+    {
+        stderr.write(record.output);
+    }
+
+    enforce(record.status == 0, stage ~ " failed (exit " ~ to!string(
+            record.status) ~ ")" ~ (diagnostics ? "" : ":\n" ~ record.output));
+
+    return record.output;
 }
 
 string compilerPath(string compiler)
@@ -118,15 +162,35 @@ string compilerPath(string compiler)
     return hasPath ? absolutePath(compiler) : compiler;
 }
 
-void identifyDCompiler(string compiler, string directory)
+void identifyDCompiler(string compiler, string directory, CommandObserver observer = null)
 {
-    auto output = run([compiler, "--version"], directory, "D compiler identification");
+    auto output = run([compiler, "--version"], directory,
+            "D compiler identification", false, observer);
 
     enforce(output.canFind("LDC") || output.canFind("DMD") || output.canFind("Digital Mars D Compiler"),
             "unsupported D compiler: expected native LDC or DMD using -of= output syntax");
 }
 
 string createWorkspace(string parent = tempDir())
+{
+    return createDirectory(parent);
+}
+
+/* Named bundles use the same private permissions, but never reuse a directory. */
+void createPrivateDirectory(string directory)
+{
+    enforce(directory.length != 0 && !directory.canFind('\0'), "invalid evidence directory");
+
+    directory = absolutePath(directory);
+
+    auto name = baseName(directory);
+
+    enforce(name.length != 0 && name != "." && name != "..", "invalid evidence directory");
+
+    createDirectory(dirName(directory), name);
+}
+
+private string createDirectory(string parent, string name = "")
 {
     version (Windows)
     {
@@ -181,7 +245,8 @@ string createWorkspace(string parent = tempDir())
 
         foreach (attempt; 0 .. 16)
         {
-            auto workspace = absolutePath(buildPath(parent, "dabiprobe-" ~ randomUUID().toString()));
+            auto workspace = absolutePath(buildPath(parent, name.length ? name
+                    : "dabiprobe-" ~ randomUUID().toString()));
 
             if (CreateDirectoryW(workspace.toUTF16z, &attributes))
             {
@@ -197,15 +262,26 @@ string createWorkspace(string parent = tempDir())
 
             auto error = GetLastError();
 
-            enforce(error == ERROR_ALREADY_EXISTS,
-                    "could not create private temporary directory (Windows error " ~ to!string(
-                        error) ~ ")");
+            enforce(name.length == 0 && error == ERROR_ALREADY_EXISTS,
+                    "could not create a new private directory; existing paths are never overwritten"
+                    ~ " (Windows error " ~ to!string(error) ~ ")");
         }
 
         throw new Exception("could not create a unique private temporary directory");
     }
     else version (Posix)
     {
+        if (name.length)
+        {
+            auto directory = absolutePath(buildPath(parent, name));
+
+            enforce(mkdir(directory.toStringz, octal!700) == 0,
+                    "could not create a new private directory: " ~ directory
+                    ~ "; its parent must exist and existing paths are never overwritten");
+
+            return directory;
+        }
+
         /* mkdtemp atomically chooses an unused name and creates mode 0700. */
         auto templatePath = (buildPath(parent, "dabiprobe-XXXXXX") ~ "\0").dup;
 
@@ -245,7 +321,7 @@ string objectPath(string workspace, string name)
 }
 
 void compileC(string compiler, string source, string output, string directory,
-        string[] flags = null, bool objectOnly = false)
+        string[] flags = null, bool objectOnly = false, CommandObserver observer = null)
 {
     auto arguments = [compiler, "-std=c11", "-I", directory] ~ flags;
 
@@ -254,14 +330,15 @@ void compileC(string compiler, string source, string output, string directory,
         arguments ~= "-c";
     }
 
-    run(arguments ~ [source, "-o", output], directory, "C compilation", true);
+    run(arguments ~ [source, "-o", output], directory, "C compilation", true, observer);
 }
 
 void compileD(string compiler, string source, string output, string directory,
-        string workspace, string[] flags = null, string[] objects = null)
+        string workspace, string[] flags = null, string[] objects = null,
+        CommandObserver observer = null)
 {
     /* Both executables and intermediate objects must stay inside the workspace. */
     run([compiler, "-I" ~ directory] ~ flags ~ [source] ~ objects ~ [
         "-of=" ~ output, "-od=" ~ workspace
-    ], directory, "D compilation", true);
+    ], directory, "D compilation", true, observer);
 }
