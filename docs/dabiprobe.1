@@ -7,6 +7,8 @@ dabiprobe \- check D bindings against C compiler ABI measurements
 .B dabiprobe
 .RB [ \-\-cc " PATH" ]
 .RB [ \-\-dc " PATH" ]
+.RB [ \-\-config " NAME" ]
+.RB [ \-\-output " DIR" ]
 .I MANIFEST.json
 .br
 .B dabiprobe \-\-help
@@ -18,8 +20,9 @@ It uses the compilers' own layout and type rules rather than a separate C or D
 declaration parser.
 .PP
 Checks include type size and alignment, selected field offsets and sizes,
-basic scalar kinds, integral values, and explicit function declaration contracts.
-Optional linked C/D call checks exercise user-supplied boolean expressions.
+field representations, integral values, and function declaration contracts.
+Compile-only D reflection can discover members and signatures from the binding.
+Optional linked C/D assertions provide separate evidence about chosen behavior.
 The C and D compilers must target the same ABI, and their output programs must
 be executable on the host.
 Linked calls also require compatible object formats, calling conventions, and
@@ -50,6 +53,19 @@ The default is
 .BR ldc2 .
 LDC and DMD command-line interfaces are supported.
 .TP
+.BI \-\-config " NAME"
+Run only the named build configuration.
+By default, all configurations in the manifest are run.
+A manifest without configurations has one configuration named
+.BR default .
+.TP
+.BI \-\-output " DIR"
+Save a structured report, configuration snapshots, generated sources, compiler
+commands, diagnostics, and a standalone replay script in a new directory.
+The parent directory must exist; existing destinations are never overwritten.
+Without this option, mismatches, unsupported requests, and probe execution
+failures retain private evidence and print its location.
+.TP
 .B \-\-help
 Print usage, options, examples, exit statuses, and safety information, then exit
 successfully.
@@ -76,6 +92,23 @@ is required.
 .PP
 Include paths, D import paths, and relative paths in compiler flags are resolved
 from the manifest's directory, not the caller's working directory.
+.SS Build configurations
+.B configurations
+is an optional nonempty array of objects containing a required
+.B name
+and optional
+.B cFlags
+and
+.B dFlags
+arrays.
+Each variant inherits the selected declarations and appends its flags to the
+base flags.
+Names must be unique and contain no control characters.
+.PP
+Results, compiler commands, and effective configuration snapshots are kept
+separate for each variant.
+One failing configuration does not prevent independent variants from running.
+The exit status reflects the highest-priority failure across the selected set.
 .SS Common properties
 .TP
 .B headers
@@ -101,17 +134,44 @@ and
 .B d
 type expressions and an optional
 .B fields
-array.
-Each type pair checks size, alignment, and basic scalar kind.
+selection.
+Each type pair checks size and alignment, with supported representation checks
+where applicable.
 .PP
-A field entry is either a string naming the member on both sides or an object
+Set
+.B fields
+to the string
+.B "*"
+to discover the D aggregate's instance fields without copying their declarations.
+Their names select corresponding C members.
+Alternatively, provide an array: a field entry is either a string naming the
+member on both sides or an object
 with
 .B c
 and
 .B d
 member names.
-Selected fields are checked for offset, size, and scalar kind.
-Only selected members are compared.
+Selected fields are checked for offset, size, and supported representation
+compatibility, including scalar signedness, array elements, pointers, and
+function-pointer contracts.
+Unselected D fields are reported as unchecked.
+C-only members and padding contents are not automatically enumerated, including
+when all D fields are selected.
+.PP
+Representation predicates use the native C compiler's type-compatibility rules
+and layout measurements against the D compiler's reflected types.
+Named aggregates use the selected C/D type mappings; this correspondence alone
+is not a whole-aggregate or calling-sequence proof.
+.PP
+For a forward-declared handle, add
+.B "\(dqopaque\(dq: true"
+to its C/D type mapping and omit
+.BR fields .
+This establishes nominal correspondence for pointer contracts without requesting
+an object size, alignment, or member layout.
+The object layout remains explicitly unchecked.
+An opaque mapping cannot establish a by-value contract; such requests are
+unsupported until a measurable non-opaque type is selected.
 .SS Integral values
 .B constants
 is an array of objects with required
@@ -125,13 +185,32 @@ large unsigned values.
 Floating-point and wider integral expressions are rejected.
 .SS Function contracts
 .B functions
-is an array of objects containing:
+is an array of objects selecting C and D declarations.
+With only
+.B c
+and
+.B d
+names, the D compiler supplies the parameter and return types.
+The C compiler independently checks projected signatures using C11 type
+compatibility.
+Unspecified-parameter declarations, such as
+.B "int f()"
+in C11, are not treated as a verified parameter count.
+No second handwritten function declaration is required for supported inference.
+.PP
+Explicit contracts remain available.
+Provide both
+.B returns
+and
+.BR parameters ,
+or neither; supplying only one is an error.
+Properties are:
 .TP
 .BR c ", " d
 Required C and D function names or expressions identifying the declarations.
 .TP
 .B returns
-Required object containing
+An explicit contract's required object containing
 .B c
 and
 .B d
@@ -141,7 +220,7 @@ Use the literal string
 for a void return; aliases to void are not supported.
 .TP
 .B parameters
-Required array of objects containing
+An explicit contract's required array of objects containing
 .B c
 and
 .B d
@@ -154,8 +233,8 @@ Optional boolean, defaulting to false.
 When true, add a C-style variadic tail after at least one fixed parameter.
 Variadic argument promotions are not checked automatically.
 .PP
-The C compiler checks compatibility with the expected function-pointer type.
-The D compiler checks conversion to an expected
+For explicit contracts, the C compiler checks compatibility with the expected
+function-pointer type and the D compiler checks conversion to an expected
 .B extern(C)
 function-pointer type.
 Compatible stronger D attributes, such as
@@ -166,6 +245,12 @@ are accepted.
 Both declarations must independently satisfy their contracts.
 Paired parameter and return sizes, alignments, and scalar kinds must also agree.
 These checks do not call the functions.
+.PP
+Inference has explicit bounds: unsupported qualifiers or callable forms, missing
+aggregate mappings, excessive type nesting, and signatures requiring more than
+256 complete candidates are reported as unsupported rather than guessed.
+Variadic and ref/out-style signatures require explicit contracts where supported.
+Native C layout predicates guard inferred integer alternatives.
 .PP
 Complex C declarators require named typedefs.
 D static-array parameters are rejected because C array parameters decay to
@@ -193,40 +278,101 @@ The expression's type must be
 and it must evaluate to true.
 .PP
 Explicit calls are compiled and run in a separate program only after passive
-layout, type, constant, and declaration checks succeed.
-A failed passive check skips the explicit call stage.
-Calls are never invented automatically for arbitrary library functions.
+layout, type, constant, and declaration checks succeed without unsupported
+requested contracts.
+A disagreement or unsupported request skips the explicit assertion stage.
+The tool runs the supplied expressions; it does not infer which functions or
+inputs they cover or invent calls to arbitrary library functions.
 .SH OUTPUT
 Results are written to standard output.
-.B PASS
-and
-.B FAIL
-lines identify each check and its measured values.
-.B SKIP
-indicates that explicit call checks were not attempted after a passive mismatch.
-A summary reports completed measurements and failures.
+Each check identifies its configuration, declaration, property, and outcome.
+Measured properties and executed behavior assertions have separate categories
+and summary counts.
+.TP
+.B checked
+A selected measurement agrees, or an explicit boolean assertion returned true.
+.TP
+.B mismatched
+A measurement or assertion disagrees.
+.TP
+.B unchecked
+A property was not examined, or execution was deliberately skipped.
+.TP
+.B unsupported
+A requested contract cannot be represented by the checker.
+.TP
+.B failed_execution
+An input or execution operation prevented verification.
 .PP
-Basic scalar-kind codes are 1 for booleans, 2 for signed integers, 3 for unsigned
-integers, and 4 for floating-point types.
-Code 0 means opaque, not recursively verified.
-Matching opaque categories do not prove equivalence of pointee types, array
-elements, aggregate internals, or nested callback signatures.
+Unchecked and unsupported records are not counted as successful checks.
+Partial coverage is labeled explicitly.
+For inferred representation predicates, 1 means compatibility holds and 0 means
+it does not.
+These predicates may also emit 2 for an unsupported unprototyped callable;
+that record is not counted as agreement or as an ordinary value mismatch.
+The report also records the reflected D type, C expression, and checking policy.
+These are compiler-derived checks, not observations of library behavior.
 .PP
 Compiler diagnostics and fatal errors are written to standard error.
 Generated probe output is indexed and validated.
 Unexpected output, including output from constructors or helpers, is an error
 rather than an additional measurement.
+.SH EVIDENCE AND REPLAY
+An evidence bundle contains
+.BR report.json ,
+.BR manifest.json ,
+.BR commands.jsonl ,
+per-configuration sources and command logs, and
+.BR replay.py .
+The versioned JSON report retains effective flags, working directories, compiler
+identification commands and logs, per-check outcomes, and source hashes.
+.PP
+Run
+.B "python3 replay.py"
+to rebuild and execute the captured checks without dabiprobe.
+The script uses fresh private scratch and never executes retained binaries.
+It supports
+.BR \-\-config ,
+.BR \-\-workdir ,
+.BR \-\-cc ,
+and
+.B \-\-dc
+overrides for selecting or relocating an equivalent setup.
+Windows replay requires Python 3.13 or newer for private-directory support.
+.PP
+Headers, D imports, libraries, response files, compiler installations and
+configuration, and other dependencies remain external.
+Replay is not a source-dependency archive or a new probe generator.
+It compares fresh D discovery metadata with the captured metadata and refuses
+stale representation predicates when declarations or target facts change.
+Run dabiprobe again to generate checks for the new configuration.
+.PP
+Only a named allowlist of build/search/runtime environment variables is saved.
+Replay inherits its current environment unless
+.B \-\-recorded-env
+is explicitly selected.
+Paths, flags, source fragments and diagnostics may contain sensitive project
+information; review bundles before sharing them.
 .SH EXIT STATUS
 .TP
 .B 0
-All requested checks passed, or help was displayed.
+No disagreement was found in supported executed checks, or help was displayed.
+Inspect coverage: this does not mean unexamined properties were verified.
 .TP
 .B 1
 At least one ABI measurement or explicit call assertion failed.
 .TP
 .B 2
 Invalid input, compiler or linker failure, probe execution error, malformed
-probe output, or another operational error prevented verification.
+probe output, evidence-export failure, or another operational error prevented
+verification.
+.TP
+.B 3
+A requested check was unsupported or remained incomplete.
+Unselected coverage notes alone do not produce this status.
+.PP
+For multiple configurations, execution/input errors take priority over mismatches,
+which take priority over unsupported or otherwise incomplete requests.
 .SH EXAMPLES
 Run the supplied layout and integral-value example:
 .PP
@@ -244,6 +390,13 @@ Select an explicitly installed D compiler:
 .PP
 .EX
 dabiprobe \-\-dc /opt/ldc/bin/ldc2 path/to/manifest.json
+.EE
+.PP
+Capture one project configuration and replay its checks:
+.PP
+.EX
+dabiprobe \-\-config release \-\-output results binding-checks.json
+python3 results/replay.py
 .EE
 .PP
 A minimal manifest checking a scalar type:
@@ -268,9 +421,13 @@ The failure gate protects only the explicit
 stage; it does not prevent arbitrary code in trusted declarations or constructors
 from running.
 .PP
-Probe files are written to private temporary directories and removed when the
-verification scope exits normally or through a handled error.
-Forced termination can leave temporary files behind.
+Probe files are written to private temporary directories.
+Successful runs remove scratch; explicit evidence export also permits scratch
+cleanup after a mismatch or error.
+Without export, unsuccessful probe runs retain their private workspace and
+evidence for diagnosis.
+The printed path can be removed after the evidence is no longer needed.
+Forced termination may also leave temporary files behind.
 On Windows, temporary storage must support a protected current-user-only ACL.
 Filesystems that cannot enforce these permissions are rejected before probe
 files are written.
@@ -280,11 +437,15 @@ running kernel, another build, or every supported target.
 Matching pointer size and endianness alone does not establish ABI compatibility.
 Use the include paths, defines, packing, and target options from the actual build.
 .PP
-Opaque types are not recursively compared.
-Unselected fields, bitfields, flexible array members, other calling conventions,
-and cross-target execution are not automatically verified.
-Floating-point size and kind do not prove identical encodings.
-Sample calls provide evidence for their selected inputs, not all possible inputs.
+Unselected fields, C-member completeness, padding contents, bitfields, flexible
+array members, ownership, lifetimes, other calling conventions, and cross-target
+execution are not automatically verified.
+Unsupported representations are explicit in the report.
+Character encoding and signed-character value semantics are not inferred from
+pairing D char with C char.
+Floating-point checks do not prove all encodings or exceptional-value behavior.
+Explicit assertions provide evidence for their selected inputs, not all possible
+inputs or every property of a prebuilt library.
 .SH FILES
 .TP
 .B README.md
@@ -295,6 +456,13 @@ Struct layout, field, and integral-value example.
 .TP
 .B examples/interop/manifest.json
 Function contracts, aggregate calls, and C-to-D callback example.
+.TP
+.B examples/glfw/run.py
+Pinned BindBC-GLFW workflow with real library calls and labeled injected
+regressions.
+.TP
+.B docs/related-work.md
+Scope comparison with ImportC and importc_compare.
 .SH SEE ALSO
 .BR cc (1),
 .BR gcc (1),

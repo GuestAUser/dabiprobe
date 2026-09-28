@@ -1,0 +1,28 @@
+{
+    "headers": ["GLFW/glfw3.h", "glfw_case.h"],
+    "imports": ["bindbc.glfw", "glfw_checks"],
+    "types": [
+        {"c": "GLFWgamepadstate", "d": "GLFWgamepadstate", "fields": "*"},
+        {"c": "GLFWvidmode", "d": "GLFWvidmode", "fields": "*"},
+        {"c": "GLFWwindow", "d": "GLFWwindow", "opaque": true}
+    ],
+    "constants": [
+        {"c": "GLFW_VERSION_MAJOR", "d": "GLFW_VERSION_MAJOR"},
+        {"c": "GLFW_VERSION_MINOR", "d": "GLFW_VERSION_MINOR"},
+        {"c": "GLFW_VERSION_REVISION", "d": "GLFW_VERSION_REVISION"},
+        {"c": "GLFW_INVALID_ENUM", "d": "GLFW_INVALID_ENUM"}
+    ],
+    "functions": [
+        {"c": "glfwGetVersion", "d": "glfwGetVersion"},
+        {"c": "glfwSetErrorCallback", "d": "glfwSetErrorCallback"},
+        {"c": "glfwInitHint", "d": "glfwInitHint"},
+        {"c": "glfwWindowShouldClose", "d": "glfwWindowShouldClose"},
+        {"c": "dabiprobeAdjustVideoMode", "d": "dabiprobeAdjustVideoMode"}
+    ],
+    "cSource": "#include \"glfw_case.c\"",
+    "calls": [
+        {"name": "GLFW linked library version 3.4.0", "d": "checkLibraryVersion()"},
+        {"name": "GLFWvidmode demonstration-owned by-value shim", "d": "checkByValueShim()"},
+        {"name": "GLFWerrorfun real-library callback and restoration", "d": "checkLibraryCallback()"}
+    ]
+}
