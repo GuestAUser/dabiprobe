@@ -1,0 +1,46 @@
+{
+    "headers": ["api.h"],
+    "imports": ["bindings"],
+    "types": [
+        {"c": "AbiPair", "d": "AbiPair", "fields": ["count", "weight"]}
+    ],
+    "functions": [
+        {
+            "c": "abi_add",
+            "d": "abi_add",
+            "returns": {"c": "int32_t", "d": "int"},
+            "parameters": [
+                {"c": "int32_t", "d": "int"},
+                {"c": "int32_t", "d": "int"}
+            ]
+        },
+        {
+            "c": "abi_adjust",
+            "d": "abi_adjust",
+            "returns": {"c": "AbiPair", "d": "AbiPair"},
+            "parameters": [
+                {"c": "AbiPair", "d": "AbiPair"},
+                {"c": "int32_t", "d": "int"}
+            ]
+        },
+        {
+            "c": "abi_apply",
+            "d": "abi_apply",
+            "returns": {"c": "int32_t", "d": "int"},
+            "parameters": [
+                {"c": "AbiCallback", "d": "AbiCallback"},
+                {"c": "int32_t", "d": "int"}
+            ]
+        }
+    ],
+    "cSource": "#include \"api.c\"",
+    "dSource": "extern(C) int doubleValue(int value) nothrow @nogc { return value * 2; }",
+    "calls": [
+        {"name": "integer arguments and return", "d": "abi_add(-7, 12) == 5"},
+        {
+            "name": "aggregate argument and return",
+            "d": "(() { auto value = abi_adjust(AbiPair(-2, 1.25), 9); return value.count == 7 && value.weight == 2.5; })()"
+        },
+        {"name": "C calls D callback", "d": "abi_apply(&doubleValue, 21) == 43"}
+    ]
+}

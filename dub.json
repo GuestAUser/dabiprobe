@@ -1,0 +1,10 @@
+{
+    "name": "dabiprobe",
+    "authors": ["GuestAUser"],
+    "license": "BSD-2-Clause",
+    "copyright": "Copyright (c) 2026 GuestAUser",
+    "description": "Check your D bindings against what the C compiler actually sees!",
+    "targetType": "executable",
+    "targetPath": ".artifacts",
+    "sourcePaths": ["source"]
+}

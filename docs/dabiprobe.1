@@ -1,0 +1,313 @@
+.TH DABIPROBE 1 "" "dabiprobe" "User Commands"
+.ds AD l
+.nr HY 0
+.SH NAME
+dabiprobe \- check D bindings against C compiler ABI measurements
+.SH SYNOPSIS
+.B dabiprobe
+.RB [ \-\-cc " PATH" ]
+.RB [ \-\-dc " PATH" ]
+.I MANIFEST.json
+.br
+.B dabiprobe \-\-help
+.SH DESCRIPTION
+.B dabiprobe
+compiles C and D probe programs and compares the ABI properties selected by a
+JSON manifest.
+It uses the compilers' own layout and type rules rather than a separate C or D
+declaration parser.
+.PP
+Checks include type size and alignment, selected field offsets and sizes,
+basic scalar kinds, integral values, and explicit function declaration contracts.
+Optional linked C/D call checks exercise user-supplied boolean expressions.
+The C and D compilers must target the same ABI, and their output programs must
+be executable on the host.
+Linked calls also require compatible object formats, calling conventions, and
+C runtime libraries; supply the project's link options through
+.BR dFlags .
+.PP
+A successful run is evidence for the selected checks, compiler configuration,
+and test inputs.
+It is not certification of an entire binding or API.
+.SH OPTIONS
+.TP
+.BI \-\-cc " PATH"
+Select a C compiler executable.
+The default is
+.B cc
+on POSIX hosts and
+.B clang
+on Windows.
+A GCC/Clang-compatible C11 command-line driver is required;
+.B cl.exe
+and
+.B clang-cl
+are not accepted driver interfaces.
+.TP
+.BI \-\-dc " PATH"
+Select a D compiler executable.
+The default is
+.BR ldc2 .
+LDC and DMD command-line interfaces are supported.
+.TP
+.B \-\-help
+Print usage, options, examples, exit statuses, and safety information, then exit
+successfully.
+.PP
+Compiler options take a single executable name or path, not a shell command.
+Quote paths containing spaces when invoking the program from a shell.
+Bare names use executable search-path lookup.
+Explicit relative compiler paths are anchored to the caller's working directory.
+.SH MANIFEST
+The manifest must be a JSON object.
+Unknown keys, missing required properties, and malformed values are errors.
+The
+.B headers
+and
+.B imports
+arrays are required, but may be empty.
+At least one entry in
+.BR types ,
+.BR constants ,
+.BR functions ,
+or
+.B calls
+is required.
+.PP
+Include paths, D import paths, and relative paths in compiler flags are resolved
+from the manifest's directory, not the caller's working directory.
+.SS Common properties
+.TP
+.B headers
+Array of C header paths, included with quoted preprocessor include directives.
+Quotes, newlines, and NUL characters are not accepted in header paths.
+.TP
+.B imports
+Array of D module names imported by generated D probes.
+.TP
+.BR cFlags ", " dFlags
+Optional arrays of individual compiler arguments.
+Arguments are passed literally, without shell splitting, variable expansion,
+or wildcard expansion by dabiprobe.
+Use these arrays for the include directories, defines, import paths, and ABI
+options used by the actual project build.
+D link flags and additional D source files may be supplied in
+.BR dFlags .
+.SS Types and fields
+.B types
+is an array of objects with required
+.B c
+and
+.B d
+type expressions and an optional
+.B fields
+array.
+Each type pair checks size, alignment, and basic scalar kind.
+.PP
+A field entry is either a string naming the member on both sides or an object
+with
+.B c
+and
+.B d
+member names.
+Selected fields are checked for offset, size, and scalar kind.
+Only selected members are compared.
+.SS Integral values
+.B constants
+is an array of objects with required
+.B c
+and
+.B d
+integral expressions.
+Each expression is evaluated once per probe.
+Values through 64 bits are compared without conflating negative numbers with
+large unsigned values.
+Floating-point and wider integral expressions are rejected.
+.SS Function contracts
+.B functions
+is an array of objects containing:
+.TP
+.BR c ", " d
+Required C and D function names or expressions identifying the declarations.
+.TP
+.B returns
+Required object containing
+.B c
+and
+.B d
+return types.
+Use the literal string
+.B void
+for a void return; aliases to void are not supported.
+.TP
+.B parameters
+Required array of objects containing
+.B c
+and
+.B d
+parameter types.
+Use an empty array for a function with no parameters.
+Do not use a void parameter entry.
+.TP
+.B variadic
+Optional boolean, defaulting to false.
+When true, add a C-style variadic tail after at least one fixed parameter.
+Variadic argument promotions are not checked automatically.
+.PP
+The C compiler checks compatibility with the expected function-pointer type.
+The D compiler checks conversion to an expected
+.B extern(C)
+function-pointer type.
+Compatible stronger D attributes, such as
+.B nothrow
+and
+.BR @nogc ,
+are accepted.
+Both declarations must independently satisfy their contracts.
+Paired parameter and return sizes, alignments, and scalar kinds must also agree.
+These checks do not call the functions.
+.PP
+Complex C declarators require named typedefs.
+D static-array parameters are rejected because C array parameters decay to
+pointers while D static arrays are passed differently.
+Use an explicit pointer contract where appropriate.
+.SS Executable interop checks
+.TP
+.B cSource
+Optional C source text compiled into an object and linked into D probes.
+The manifest's headers are included first.
+An include directive such as
+.B "#include \(dqapi.c\(dq"
+allows implementation code to remain in an ordinary source file.
+.TP
+.B dSource
+Optional module-level D declarations or helpers appended after the imports.
+.TP
+.B calls
+Optional array of objects with a descriptive
+.B name
+and a D expression in
+.BR d .
+The expression's type must be
+.BR bool ,
+and it must evaluate to true.
+.PP
+Explicit calls are compiled and run in a separate program only after passive
+layout, type, constant, and declaration checks succeed.
+A failed passive check skips the explicit call stage.
+Calls are never invented automatically for arbitrary library functions.
+.SH OUTPUT
+Results are written to standard output.
+.B PASS
+and
+.B FAIL
+lines identify each check and its measured values.
+.B SKIP
+indicates that explicit call checks were not attempted after a passive mismatch.
+A summary reports completed measurements and failures.
+.PP
+Basic scalar-kind codes are 1 for booleans, 2 for signed integers, 3 for unsigned
+integers, and 4 for floating-point types.
+Code 0 means opaque, not recursively verified.
+Matching opaque categories do not prove equivalence of pointee types, array
+elements, aggregate internals, or nested callback signatures.
+.PP
+Compiler diagnostics and fatal errors are written to standard error.
+Generated probe output is indexed and validated.
+Unexpected output, including output from constructors or helpers, is an error
+rather than an additional measurement.
+.SH EXIT STATUS
+.TP
+.B 0
+All requested checks passed, or help was displayed.
+.TP
+.B 1
+At least one ABI measurement or explicit call assertion failed.
+.TP
+.B 2
+Invalid input, compiler or linker failure, probe execution error, malformed
+probe output, or another operational error prevented verification.
+.SH EXAMPLES
+Run the supplied layout and integral-value example:
+.PP
+.EX
+dabiprobe examples/packet/manifest.json
+.EE
+.PP
+Use Clang and LDC for the aggregate and callback example:
+.PP
+.EX
+dabiprobe \-\-cc clang \-\-dc ldc2 examples/interop/manifest.json
+.EE
+.PP
+Select an explicitly installed D compiler:
+.PP
+.EX
+dabiprobe \-\-dc /opt/ldc/bin/ldc2 path/to/manifest.json
+.EE
+.PP
+A minimal manifest checking a scalar type:
+.PP
+.EX
+{
+  "headers": ["stdint.h"],
+  "imports": [],
+  "types": [{"c": "int32_t", "d": "int"}]
+}
+.EE
+.SH SECURITY
+Run only trusted manifests, headers, D modules, source fragments, and compiler
+flags.
+Compilation and probe execution can execute code with the caller's privileges.
+The program is not a sandbox and does not impose a subprocess time limit.
+.PP
+Imported modules and linked code may execute constructors before passive results
+are available.
+The failure gate protects only the explicit
+.B calls
+stage; it does not prevent arbitrary code in trusted declarations or constructors
+from running.
+.PP
+Probe files are written to private temporary directories and removed when the
+verification scope exits normally or through a handled error.
+Forced termination can leave temporary files behind.
+On Windows, temporary storage must support a protected current-user-only ACL.
+Filesystems that cannot enforce these permissions are rejected before probe
+files are written.
+.SH LIMITATIONS
+Checks describe the selected compiler target and build configuration, not a
+running kernel, another build, or every supported target.
+Matching pointer size and endianness alone does not establish ABI compatibility.
+Use the include paths, defines, packing, and target options from the actual build.
+.PP
+Opaque types are not recursively compared.
+Unselected fields, bitfields, flexible array members, other calling conventions,
+and cross-target execution are not automatically verified.
+Floating-point size and kind do not prove identical encodings.
+Sample calls provide evidence for their selected inputs, not all possible inputs.
+.SH FILES
+.TP
+.B README.md
+Project overview and build instructions.
+.TP
+.B examples/packet/manifest.json
+Struct layout, field, and integral-value example.
+.TP
+.B examples/interop/manifest.json
+Function contracts, aggregate calls, and C-to-D callback example.
+.SH SEE ALSO
+.BR cc (1),
+.BR gcc (1),
+.BR clang (1),
+.BR ldc2 (1),
+.BR dmd (1)
+.SH AUTHOR
+GuestAUser
+.UR https://github.com/GuestAUser
+.UE
+.SH COPYRIGHT
+Copyright (c) 2026 GuestAUser.
+Released under the BSD 2-Clause License.
+See the distribution's
+.B LICENSE
+file for the complete terms and warranty disclaimer.

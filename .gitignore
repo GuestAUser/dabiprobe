@@ -1,0 +1,6 @@
+/.artifacts/
+/.dub/
+/dabiprobe
+*.o
+*.obj
+*:Zone.Identifier

@@ -1,0 +1,18 @@
+{
+  "headers": ["packet.h"],
+  "imports": ["packet"],
+  "cFlags": ["-I."],
+  "dFlags": ["-I."],
+  "types": [
+    {
+      "c": "struct Packet",
+      "d": "Packet",
+      "fields": ["tag", "value", "samples"]
+    }
+  ],
+  "constants": [
+    {"c": "PACKET_LIMIT", "d": "packetLimit"},
+    {"c": "PACKET_NEGATIVE", "d": "packetNegative"},
+    {"c": "PACKET_MAXIMUM", "d": "packetMaximum"}
+  ]
+}
